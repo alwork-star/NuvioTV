@@ -97,7 +97,13 @@ workflows:
       - name: Build the tvOS app
         script: |
           cd NuvioMobile
-          xcode-project build-ipa --project iosApp/iosApp.xcodeproj --scheme NuvioTV
+          # Swift packages go to a folder we own, get patched (scripts/codemagic/patch-packages.py), then
+          # the archive uses exactly those checkouts.
+          SPM="$HOME/spm-nuviotv"
+          xcodebuild -resolvePackageDependencies -project iosApp/iosApp.xcodeproj -scheme NuvioTV -clonedSourcePackagesDirPath "$SPM"
+          python3 ../scripts/codemagic/patch-packages.py "$SPM"
+          xcode-project build-ipa --project iosApp/iosApp.xcodeproj --scheme NuvioTV \
+            --archive-flags="-clonedSourcePackagesDirPath $SPM -disableAutomaticPackageResolution"
     artifacts:
       - NuvioMobile/build/ios/ipa/*.ipa
       - /tmp/xcodebuild_logs/*.log
