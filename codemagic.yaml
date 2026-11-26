@@ -55,6 +55,12 @@ workflows:
           git submodule update --init NuvioMobile
           git -C NuvioMobile submodule update --init --recursive MPVKit
           test -f NuvioMobile/MPVKit/Package.swift || { echo "MPVKit submodule missing" >&2; exit 1; }
+          # App Store Connect rejected build 154 (ITMS-90338): the plugin crypto called CommonCrypto's
+          # private GCM one-shot functions. This patch moves AES-GCM onto the public CCCrypt call.
+          # --check first so an upstream change to these files stops the build instead of half-applying.
+          git -C NuvioMobile apply --check "$PWD/scaffolding/gcm-public-api.patch"
+          git -C NuvioMobile apply "$PWD/scaffolding/gcm-public-api.patch"
+          if grep -rn "CCCryptorGCM[A-Za-z]*(" NuvioMobile/shared/src; then echo "private GCM call still in shared sources" >&2; exit 1; fi
           command -v cmake >/dev/null || brew install cmake
           java -version 2>&1 | head -1
           # quickjs-kt expects Xcode output in <cfg>-<sdk>/ (e.g. Debug-appletvos/). The CMake on these Macs
@@ -92,6 +98,12 @@ workflows:
           bash scaffolding/build-quickjs-tvos.sh "$QJS"
       - name: Point the project at our bundle ids
         script: bash scripts/codemagic/prepare.sh
+      - name: Test the public-API AES-GCM (JVM, against javax.crypto)
+        script: |
+          # The GCM rewrite for ITMS-90338 is hand-written crypto: prove it on the JVM before the long
+          # tvOS compile. A wrong tag would silently break add-ons that use AES-GCM.
+          cd NuvioMobile
+          ./gradlew --no-daemon :shared:jvmTest --tests '*AesGcm*'
       - name: Apply signing
         script: xcode-project use-profiles --project NuvioMobile/iosApp/iosApp.xcodeproj
       - name: Build the tvOS app
@@ -104,6 +116,14 @@ workflows:
           python3 ../scripts/codemagic/patch-packages.py "$SPM"
           xcode-project build-ipa --project iosApp/iosApp.xcodeproj --scheme NuvioTV \
             --archive-flags="-clonedSourcePackagesDirPath $SPM -disableAutomaticPackageResolution"
+      - name: Stop before upload if a private GCM symbol is in the app
+        script: |
+          # The check App Store Connect ran on build 154 (ITMS-90338), done here so a bad binary never uploads.
+          IPA=$(ls NuvioMobile/build/ios/ipa/*.ipa | head -1)
+          CHECK=$(mktemp -d)
+          unzip -q "$IPA" -d "$CHECK"
+          if grep -rl "CCCryptorGCM" "$CHECK/Payload"; then echo "private CCCryptorGCM symbol found in the files above" >&2; exit 1; fi
+          echo "No CCCryptorGCM symbol in the app"
     artifacts:
       - NuvioMobile/build/ios/ipa/*.ipa
       - /tmp/xcodebuild_logs/*.log

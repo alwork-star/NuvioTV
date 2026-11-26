@@ -1,0 +1,437 @@
+diff --git a/shared/src/commonMain/kotlin/com/nuvio/app/features/plugins/AesGcm.kt b/shared/src/commonMain/kotlin/com/nuvio/app/features/plugins/AesGcm.kt
+new file mode 100644
+index 0000000..5bfdb26
+--- /dev/null
++++ b/shared/src/commonMain/kotlin/com/nuvio/app/features/plugins/AesGcm.kt
+@@ -0,0 +1,150 @@
++package com.nuvio.app.features.plugins
++
++/**
++ * AES-GCM (NIST SP 800-38D) built on a plain AES block cipher, so the Apple targets need only
++ * the public CommonCrypto `CCCrypt` (ECB) entry point. The CommonCrypto GCM functions
++ * (`CCCryptorGCMOneshotEncrypt` / `CCCryptorGCMOneshotDecrypt`) are SPI: App Store Connect
++ * rejects binaries that reference them (ITMS-90338, NuvioTV build 154).
++ *
++ * Layout matches WebCrypto/CryptoJS peers: output is ciphertext||tag, 128-bit tag, empty AAD.
++ * [encryptBlocks] must AES-ECB-encrypt its input (a whole number of 16-byte blocks, no padding)
++ * with the caller's key and return an array of the same size.
++ */
++internal object AesGcm {
++    const val TAG_LENGTH = 16
++    private const val BLOCK = 16
++
++    /** Returns ciphertext||tag. */
++    fun seal(iv: ByteArray, plaintext: ByteArray, encryptBlocks: (ByteArray) -> ByteArray): ByteArray {
++        require(iv.isNotEmpty()) { "AES-GCM requires an IV" }
++        val (hHi, hLo) = hashSubkey(encryptBlocks)
++        val stream = keystream(counterZero(iv, hHi, hLo), plaintext.size, encryptBlocks)
++        val cipherText = ByteArray(plaintext.size) { i -> (plaintext[i].toInt() xor stream[BLOCK + i].toInt()).toByte() }
++        return cipherText + tag(cipherText, stream, hHi, hLo)
++    }
++
++    /**
++     * Takes ciphertext||tag and returns the plaintext. Throws [IllegalArgumentException] when the
++     * input is shorter than a tag and [IllegalStateException] when the tag does not verify; no
++     * plaintext is produced before the tag has been checked.
++     */
++    fun open(iv: ByteArray, sealed: ByteArray, encryptBlocks: (ByteArray) -> ByteArray): ByteArray {
++        require(iv.isNotEmpty()) { "AES-GCM requires an IV" }
++        require(sealed.size >= TAG_LENGTH) { "Data too short for GCM decryption" }
++        val cipherLength = sealed.size - TAG_LENGTH
++        val cipherText = sealed.copyOfRange(0, cipherLength)
++        val (hHi, hLo) = hashSubkey(encryptBlocks)
++        val stream = keystream(counterZero(iv, hHi, hLo), cipherLength, encryptBlocks)
++        val expected = tag(cipherText, stream, hHi, hLo)
++        var diff = 0
++        for (i in 0 until TAG_LENGTH) {
++            diff = diff or (expected[i].toInt() xor sealed[cipherLength + i].toInt())
++        }
++        if (diff != 0) error("AES-GCM decryption failed (tag verification failed)")
++        return ByteArray(cipherLength) { i -> (cipherText[i].toInt() xor stream[BLOCK + i].toInt()).toByte() }
++    }
++
++    // H = E_K(0^128), as two big-endian 64-bit halves.
++    private fun hashSubkey(encryptBlocks: (ByteArray) -> ByteArray): Pair<Long, Long> {
++        val h = encryptBlocks(ByteArray(BLOCK))
++        check(h.size == BLOCK) { "AES block cipher returned ${h.size} bytes for one block" }
++        return readLong(h, 0) to readLong(h, 8)
++    }
++
++    // J0: IV||0^31||1 for the standard 96-bit IV, GHASH(IV padded || 0^64 || [len(IV)]_64) otherwise.
++    private fun counterZero(iv: ByteArray, hHi: Long, hLo: Long): ByteArray {
++        val j0 = ByteArray(BLOCK)
++        if (iv.size == 12) {
++            iv.copyInto(j0)
++            j0[15] = 1
++            return j0
++        }
++        val state = LongArray(2)
++        ghashUpdate(state, iv, hHi, hLo)
++        ghashBlock(state, 0L, iv.size.toLong() * 8, hHi, hLo)
++        writeLong(j0, 0, state[0])
++        writeLong(j0, 8, state[1])
++        return j0
++    }
++
++    // E_K(J0) || E_K(J0+1) || ... : block 0 masks the tag, the rest is the CTR keystream.
++    private fun keystream(j0: ByteArray, dataLength: Int, encryptBlocks: (ByteArray) -> ByteArray): ByteArray {
++        val blocks = 1 + (dataLength + BLOCK - 1) / BLOCK
++        val counters = ByteArray(blocks * BLOCK)
++        var counter = ((j0[12].toInt() and 0xff) shl 24) or ((j0[13].toInt() and 0xff) shl 16) or
++            ((j0[14].toInt() and 0xff) shl 8) or (j0[15].toInt() and 0xff)
++        for (b in 0 until blocks) {
++            val offset = b * BLOCK
++            j0.copyInto(counters, offset, 0, 12)
++            counters[offset + 12] = (counter ushr 24).toByte()
++            counters[offset + 13] = (counter ushr 16).toByte()
++            counters[offset + 14] = (counter ushr 8).toByte()
++            counters[offset + 15] = counter.toByte()
++            counter += 1 // inc32: wraps modulo 2^32
++        }
++        val stream = encryptBlocks(counters)
++        check(stream.size == counters.size) { "AES block cipher returned ${stream.size} bytes for ${counters.size}" }
++        return stream
++    }
++
++    // T = E_K(J0) xor GHASH(C padded || [len(A)=0]_64 || [len(C)]_64).
++    private fun tag(cipherText: ByteArray, stream: ByteArray, hHi: Long, hLo: Long): ByteArray {
++        val state = LongArray(2)
++        ghashUpdate(state, cipherText, hHi, hLo)
++        ghashBlock(state, 0L, cipherText.size.toLong() * 8, hHi, hLo)
++        val out = ByteArray(TAG_LENGTH)
++        writeLong(out, 0, state[0] xor readLong(stream, 0))
++        writeLong(out, 8, state[1] xor readLong(stream, 8))
++        return out
++    }
++
++    // Absorbs data in 16-byte blocks, zero-padding the last partial block.
++    private fun ghashUpdate(state: LongArray, data: ByteArray, hHi: Long, hLo: Long) {
++        var offset = 0
++        while (offset + BLOCK <= data.size) {
++            ghashBlock(state, readLong(data, offset), readLong(data, offset + 8), hHi, hLo)
++            offset += BLOCK
++        }
++        if (offset < data.size) {
++            val last = ByteArray(BLOCK)
++            data.copyInto(last, 0, offset, data.size)
++            ghashBlock(state, readLong(last, 0), readLong(last, 8), hHi, hLo)
++        }
++    }
++
++    // state = (state xor block) * H in GF(2^128), SP 800-38D algorithm 1 (bit 0 = most significant).
++    private fun ghashBlock(state: LongArray, blockHi: Long, blockLo: Long, hHi: Long, hLo: Long) {
++        val xHi = state[0] xor blockHi
++        val xLo = state[1] xor blockLo
++        var zHi = 0L
++        var zLo = 0L
++        var vHi = hHi
++        var vLo = hLo
++        for (i in 0 until 128) {
++            val bit = if (i < 64) (xHi ushr (63 - i)) and 1L else (xLo ushr (127 - i)) and 1L
++            if (bit != 0L) {
++                zHi = zHi xor vHi
++                zLo = zLo xor vLo
++            }
++            val carry = vLo and 1L
++            vLo = (vLo ushr 1) or (vHi shl 63)
++            vHi = vHi ushr 1
++            if (carry != 0L) vHi = vHi xor REDUCTION
++        }
++        state[0] = zHi
++        state[1] = zLo
++    }
++
++    // R = 11100001 || 0^120, high half.
++    private const val REDUCTION = -0x1f00000000000000L // 0xE1 shl 56
++
++    private fun readLong(bytes: ByteArray, offset: Int): Long {
++        var value = 0L
++        for (i in 0 until 8) value = (value shl 8) or (bytes[offset + i].toLong() and 0xff)
++        return value
++    }
++
++    private fun writeLong(bytes: ByteArray, offset: Int, value: Long) {
++        for (i in 0 until 8) bytes[offset + i] = (value ushr (56 - 8 * i)).toByte()
++    }
++}
+diff --git a/shared/src/jvmTest/kotlin/com/nuvio/app/features/plugins/AesGcmJvmTest.kt b/shared/src/jvmTest/kotlin/com/nuvio/app/features/plugins/AesGcmJvmTest.kt
+new file mode 100644
+index 0000000..5f31687
+--- /dev/null
++++ b/shared/src/jvmTest/kotlin/com/nuvio/app/features/plugins/AesGcmJvmTest.kt
+@@ -0,0 +1,81 @@
++package com.nuvio.app.features.plugins
++
++import javax.crypto.Cipher
++import javax.crypto.spec.GCMParameterSpec
++import javax.crypto.spec.SecretKeySpec
++import kotlin.random.Random
++import kotlin.test.Test
++import kotlin.test.assertContentEquals
++import kotlin.test.assertFailsWith
++
++/**
++ * Host-runnable check of the shared AES-GCM (the tvOS path feeds it CommonCrypto's public
++ * AES-ECB; here the JDK's AES-ECB stands in) against the JDK's own AES/GCM/NoPadding and the
++ * GCM spec vectors. tvosTest/PluginCryptoGcmTest covers the same vectors through CCCrypt.
++ */
++class AesGcmJvmTest {
++
++    private fun ecb(key: ByteArray): (ByteArray) -> ByteArray = { blocks ->
++        Cipher.getInstance("AES/ECB/NoPadding").apply { init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES")) }.doFinal(blocks)
++    }
++
++    private fun jdkSeal(key: ByteArray, iv: ByteArray, plain: ByteArray): ByteArray =
++        Cipher.getInstance("AES/GCM/NoPadding")
++            .apply { init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv)) }
++            .doFinal(plain)
++
++    private fun hex(value: String): ByteArray = ByteArray(value.length / 2) { value.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
++
++    @Test
++    fun specTestCase3() {
++        val key = hex("feffe9928665731c6d6a8f9467308308")
++        val iv = hex("cafebabefacedbaddecaf888")
++        val plain = hex(
++            "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72" +
++                "1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255",
++        )
++        val sealed = hex(
++            "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e" +
++                "21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091473f5985" +
++                "4d5c2af327cd64a62cf35abd2ba6fab4",
++        )
++        assertContentEquals(sealed, AesGcm.seal(iv, plain, ecb(key)))
++        assertContentEquals(plain, AesGcm.open(iv, sealed, ecb(key)))
++    }
++
++    @Test
++    fun emptyPlaintextIsTagOnly() {
++        val tag = hex("58e2fccefa7e3061367f1d57a4e7455a")
++        assertContentEquals(tag, AesGcm.seal(ByteArray(12), ByteArray(0), ecb(ByteArray(16))))
++        assertContentEquals(ByteArray(0), AesGcm.open(ByteArray(12), tag, ecb(ByteArray(16))))
++    }
++
++    @Test
++    fun matchesJdkAcrossKeyIvAndDataSizes() {
++        val random = Random(90338)
++        for (keySize in listOf(16, 24, 32)) {
++            for (ivSize in listOf(1, 8, 12, 13, 16, 17, 32, 60)) {
++                for (length in listOf(0, 1, 15, 16, 17, 31, 32, 33, 133, 1000)) {
++                    val key = random.nextBytes(keySize)
++                    val iv = random.nextBytes(ivSize)
++                    val plain = random.nextBytes(length)
++                    val sealed = AesGcm.seal(iv, plain, ecb(key))
++                    assertContentEquals(jdkSeal(key, iv, plain), sealed, "key=$keySize iv=$ivSize len=$length")
++                    assertContentEquals(plain, AesGcm.open(iv, sealed, ecb(key)))
++                }
++            }
++        }
++    }
++
++    @Test
++    fun tamperedInputFailsAndShortInputIsRejected() {
++        val key = ByteArray(32) { it.toByte() }
++        val iv = ByteArray(12) { (it * 3).toByte() }
++        val sealed = AesGcm.seal(iv, ByteArray(40) { it.toByte() }, ecb(key))
++        for (index in listOf(0, 39, 40, sealed.size - 1)) {
++            val tampered = sealed.copyOf().also { it[index] = (it[index].toInt() xor 0x01).toByte() }
++            assertFailsWith<IllegalStateException> { AesGcm.open(iv, tampered, ecb(key)) }
++        }
++        assertFailsWith<IllegalArgumentException> { AesGcm.open(iv, ByteArray(15), ecb(key)) }
++    }
++}
+diff --git a/shared/src/nativeInterop/cinterop/commoncrypto_shim.h b/shared/src/nativeInterop/cinterop/commoncrypto_shim.h
+index cf295c0..9158d47 100644
+--- a/shared/src/nativeInterop/cinterop/commoncrypto_shim.h
++++ b/shared/src/nativeInterop/cinterop/commoncrypto_shim.h
+@@ -116,41 +116,9 @@ CCCryptorStatus CCCrypt(
+ );
+ 
+ /*
+- * AES-GCM one-shot SPI (CommonCryptoSPI.h; symbols exported from libSystem since
+- * iOS/tvOS 11). Only these entry points are declared on purpose: the deprecated
+- * streaming sequence (CCCryptorCreateWithMode + CCCryptorGCMEncrypt/GCMFinal)
+- * ignores the create-time IV unless CCCryptorGCMAddIV is called, and GCMFinal
+- * OUTPUTS the computed tag rather than verifying one, so it invites exactly the
+- * unauthenticated-decrypt misuse this shim once carried. The one-shot decrypt
+- * verifies tagIn internally and returns a non-zero status on mismatch.
++ * No CommonCrypto GCM entry points are declared here on purpose. CCCryptorGCMOneshotEncrypt /
++ * CCCryptorGCMOneshotDecrypt (and the older streaming CCCryptorGCM* calls) are SPI from
++ * CommonCryptoSPI.h: App Store Connect rejects any binary that references them (ITMS-90338,
++ * NuvioTV build 154). AES-GCM is implemented in shared Kotlin (AesGcm.kt) on top of the public
++ * CCCrypt ECB call above.
+  */
+-CCCryptorStatus CCCryptorGCMOneshotEncrypt(
+-    CCAlgorithm alg,
+-    const void *key,
+-    size_t keyLength,
+-    const void *iv,
+-    size_t ivLength,
+-    const void *aData,
+-    size_t aDataLength,
+-    const void *dataIn,
+-    size_t dataInLength,
+-    void *cipherOut,
+-    void *tagOut,
+-    size_t tagLength
+-);
+-
+-CCCryptorStatus CCCryptorGCMOneshotDecrypt(
+-    CCAlgorithm alg,
+-    const void *key,
+-    size_t keyLength,
+-    const void *iv,
+-    size_t ivLength,
+-    const void *aData,
+-    size_t aDataLength,
+-    const void *dataIn,
+-    size_t dataInLength,
+-    void *dataOut,
+-    const void *tagIn,
+-    size_t tagLength
+-);
+-
+diff --git a/shared/src/tvosMain/kotlin/com/nuvio/app/features/plugins/PluginCrypto.tvos.kt b/shared/src/tvosMain/kotlin/com/nuvio/app/features/plugins/PluginCrypto.tvos.kt
+index b6c5466..5201e36 100644
+--- a/shared/src/tvosMain/kotlin/com/nuvio/app/features/plugins/PluginCrypto.tvos.kt
++++ b/shared/src/tvosMain/kotlin/com/nuvio/app/features/plugins/PluginCrypto.tvos.kt
+@@ -115,13 +115,7 @@ internal fun pluginAesEncrypt(
+     }
+ 
+     if (mode.uppercase().contains("GCM")) {
+-        val cipherText = ByteArray(data.size)
+-        val tag = ByteArray(GCM_TAG_LENGTH)
+-        val status = gcmOneshot(encrypt = true, key = key, iv = iv, input = data, output = cipherText, tag = tag)
+-        if (status != kCCSuccess) {
+-            error("CCCryptorGCMOneshotEncrypt failed with status: $status")
+-        }
+-        return cipherText + tag
++        return AesGcm.seal(iv, data) { blocks -> aesEcbEncryptBlocks(key, blocks) }
+     }
+ 
+     val isEcb = mode.uppercase().contains("ECB")
+@@ -188,16 +182,7 @@ internal fun pluginAesDecrypt(
+     }
+ 
+     if (mode.uppercase().contains("GCM")) {
+-        require(data.size >= GCM_TAG_LENGTH) { "Data too short for GCM decryption" }
+-        val cipherTextLength = data.size - GCM_TAG_LENGTH
+-        val cipherText = data.copyOfRange(0, cipherTextLength)
+-        val tag = data.copyOfRange(cipherTextLength, data.size)
+-        val plainText = ByteArray(cipherTextLength)
+-        val status = gcmOneshot(encrypt = false, key = key, iv = iv, input = cipherText, output = plainText, tag = tag)
+-        if (status != kCCSuccess) {
+-            error("AES-GCM decryption failed with status: $status (tag verification failed)")
+-        }
+-        return plainText
++        return AesGcm.open(iv, data) { blocks -> aesEcbEncryptBlocks(key, blocks) }
+     }
+ 
+     val isEcb = mode.uppercase().contains("ECB")
+@@ -251,64 +236,38 @@ internal fun pluginAesDecrypt(
+     return finalData ?: ByteArray(0)
+ }
+ 
+-// WebCrypto's AES-GCM default: 128-bit tag appended to the ciphertext. The plugin JS bridge
+-// exposes no AAD parameter, so associated data is always empty.
+-private const val GCM_TAG_LENGTH = 16
+-
++// AES-GCM runs in shared Kotlin (AesGcm.kt) on top of this public CCCrypt ECB call. The
++// CommonCrypto GCM one-shot functions are SPI and App Store Connect rejects binaries that
++// reference them (ITMS-90338, build 154), so nothing here may call CCCryptorGCM*.
+ @OptIn(ExperimentalForeignApi::class)
+-private fun gcmOneshot(
+-    encrypt: Boolean,
+-    key: ByteArray,
+-    iv: ByteArray,
+-    input: ByteArray,
+-    output: ByteArray,
+-    tag: ByteArray,
+-): Int {
+-    // usePinned cannot produce a pointer into an empty array; CommonCrypto accepts any valid
+-    // pointer alongside a zero length, so empty in/out buffers pin a 1-byte stand-in instead.
+-    val inputBuffer = if (input.isEmpty()) ByteArray(1) else input
+-    val outputBuffer = if (output.isEmpty()) ByteArray(1) else output
+-    return key.usePinned { pinnedKey ->
+-        iv.usePinned { pinnedIv ->
+-            inputBuffer.usePinned { pinnedInput ->
+-                outputBuffer.usePinned { pinnedOutput ->
+-                    tag.usePinned { pinnedTag ->
+-                        if (encrypt) {
+-                            CCCryptorGCMOneshotEncrypt(
+-                                alg = kCCAlgorithmAES,
+-                                key = pinnedKey.addressOf(0),
+-                                keyLength = key.size.toULong(),
+-                                iv = pinnedIv.addressOf(0),
+-                                ivLength = iv.size.toULong(),
+-                                aData = null,
+-                                aDataLength = 0UL,
+-                                dataIn = pinnedInput.addressOf(0),
+-                                dataInLength = input.size.toULong(),
+-                                cipherOut = pinnedOutput.addressOf(0),
+-                                tagOut = pinnedTag.addressOf(0),
+-                                tagLength = tag.size.toULong(),
+-                            )
+-                        } else {
+-                            CCCryptorGCMOneshotDecrypt(
+-                                alg = kCCAlgorithmAES,
+-                                key = pinnedKey.addressOf(0),
+-                                keyLength = key.size.toULong(),
+-                                iv = pinnedIv.addressOf(0),
+-                                ivLength = iv.size.toULong(),
+-                                aData = null,
+-                                aDataLength = 0UL,
+-                                dataIn = pinnedInput.addressOf(0),
+-                                dataInLength = input.size.toULong(),
+-                                dataOut = pinnedOutput.addressOf(0),
+-                                tagIn = pinnedTag.addressOf(0),
+-                                tagLength = tag.size.toULong(),
+-                            )
+-                        }
+-                    }
++private fun aesEcbEncryptBlocks(key: ByteArray, blocks: ByteArray): ByteArray {
++    require(blocks.isNotEmpty() && blocks.size % 16 == 0) { "AES-ECB input must be whole 16-byte blocks" }
++    val out = ByteArray(blocks.size)
++    memScoped {
++        val moved = alloc<platform.posix.size_tVar>()
++        key.usePinned { pinnedKey ->
++            blocks.usePinned { pinnedIn ->
++                out.usePinned { pinnedOut ->
++                    val status = CCCrypt(
++                        op = kCCEncrypt,
++                        alg = kCCAlgorithmAES,
++                        options = kCCOptionECBMode,
++                        key = pinnedKey.addressOf(0),
++                        keyLength = key.size.toULong(),
++                        iv = null,
++                        dataIn = pinnedIn.addressOf(0),
++                        dataInLength = blocks.size.toULong(),
++                        dataOut = pinnedOut.addressOf(0),
++                        dataOutAvailable = out.size.toULong(),
++                        dataOutMoved = moved.ptr,
++                    )
++                    if (status != kCCSuccess) error("CCCrypt AES-ECB failed with status: $status")
++                    check(moved.value.toInt() == out.size) { "CCCrypt AES-ECB wrote ${moved.value} of ${out.size} bytes" }
+                 }
+             }
+         }
+     }
++    return out
+ }
+ 
+ internal fun pluginSign(algorithm: String, privateKey: ByteArray, data: ByteArray): ByteArray {
+diff --git a/shared/src/tvosTest/kotlin/com/nuvio/app/features/plugins/PluginCryptoGcmTest.kt b/shared/src/tvosTest/kotlin/com/nuvio/app/features/plugins/PluginCryptoGcmTest.kt
+index 8609147..452c411 100644
+--- a/shared/src/tvosTest/kotlin/com/nuvio/app/features/plugins/PluginCryptoGcmTest.kt
++++ b/shared/src/tvosTest/kotlin/com/nuvio/app/features/plugins/PluginCryptoGcmTest.kt
+@@ -6,7 +6,8 @@ import kotlin.test.assertFailsWith
+ 
+ /**
+  * Known-answer AES-GCM vectors from the McGrew–Viega GCM spec (the set NIST republishes),
+- * proving the CommonCrypto one-shot path interoperates with WebCrypto/CryptoJS peers:
++ * proving the shared AES-GCM (AesGcm.kt over CommonCrypto's public AES-ECB; the one-shot GCM SPI it
++ * replaced is rejected by App Store Connect, ITMS-90338) interoperates with WebCrypto/CryptoJS peers:
+  * ciphertext||tag layout, 96-bit IV, empty AAD, 128-bit tag. The tamper cases pin down that
+  * decrypt actually enforces the tag — the previous streaming-SPI implementation both ignored
+  * the IV and skipped tag verification, so every vector here would have failed.
