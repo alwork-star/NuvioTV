@@ -20,7 +20,15 @@ workflows:
         script: |
           if [ -z "${CERTIFICATE_PRIVATE_KEY:-}" ]; then echo "CERTIFICATE_PRIVATE_KEY is not set: stopping so a new orphan certificate is not created" >&2; exit 1; fi
           printf '%s\n' "$CERTIFICATE_PRIVATE_KEY" > /tmp/cert_key && chmod 600 /tmp/cert_key
-          # --create registers the bundle ids on the first run.
+          # Guard: reuse the team's existing distribution certificate. If none matches this key, stop
+          # rather than let --create below mint a new certificate.
+          MATCH=$(app-store-connect list-certificates --type DISTRIBUTION --certificate-key @file:/tmp/cert_key --json 2>/dev/null || echo '[]')
+          [ "$(printf '%s' "$MATCH" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" -gt 0 ] || \
+            MATCH=$(app-store-connect list-certificates --type IOS_DISTRIBUTION --certificate-key @file:/tmp/cert_key --json 2>/dev/null || echo '[]')
+          if [ "$(printf '%s' "$MATCH" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" -eq 0 ]; then
+            echo "No existing distribution certificate matches CERTIFICATE_PRIVATE_KEY: stopping (would create a new one)." >&2; exit 1
+          fi
+          # --create registers the bundle ids and profiles on the first run.
           app-store-connect fetch-signing-files "$APP_BUNDLE_ID" --strict-match-identifier --type TVOS_APP_STORE --create --certificate-key @file:/tmp/cert_key
           app-store-connect fetch-signing-files "$APP_BUNDLE_ID.topshelf" --strict-match-identifier --type TVOS_APP_STORE --create --certificate-key @file:/tmp/cert_key
           keychain initialize
