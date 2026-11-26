@@ -73,7 +73,22 @@ workflows:
           p, old, new = sys.argv[1:4]
           s = open(p).read(); open(p, "w").write(s.replace(old, new, 1))
           PY
-          cmake --version | head -1
+          # CMake 4.x (Homebrew here) also defaults CMAKE_OSX_SYSROOT to the macOS SDK for tvOS targets
+          # ("MacOSX26.5.sdk is not an tvOS SDK", build 6b0879e9). Name the tvOS SDKs explicitly, and build
+          # with CMake 3.31 like the upstream Mac.
+          CML="$QJS/quickjs/native/CMakeLists.txt"
+          python3 - "$CML" <<'PY'
+          import sys, re
+          p = sys.argv[1]; s = open(p).read()
+          for plat, sdk in (("tvos_aarch64", "appletvos"), ("tvos_simulator_aarch64", "appletvsimulator")):
+              head = 'elseif (TARGET_PLATFORM STREQUAL "%s")\n    set(CMAKE_SYSTEM_NAME "tvOS")\n' % plat
+              assert head in s, "tvOS block not found for " + plat
+              s = s.replace(head, head + '    set(CMAKE_OSX_SYSROOT "%s")\n' % sdk, 1)
+          open(p, "w").write(s)
+          PY
+          python3 -m venv "$HOME/cmake331" && "$HOME/cmake331/bin/pip" install --quiet "cmake==3.31.6"
+          export CMAKE_PATH="$HOME/cmake331/bin/cmake"
+          "$CMAKE_PATH" --version | head -1
           bash scaffolding/build-quickjs-tvos.sh "$QJS"
       - name: Point the project at our bundle ids
         script: bash scripts/codemagic/prepare.sh
