@@ -57,7 +57,24 @@ workflows:
           test -f NuvioMobile/MPVKit/Package.swift || { echo "MPVKit submodule missing" >&2; exit 1; }
           command -v cmake >/dev/null || brew install cmake
           java -version 2>&1 | head -1
-          bash scaffolding/build-quickjs-tvos.sh "$HOME/quickjs-kt-tvos"
+          # quickjs-kt expects Xcode output in <cfg>-<sdk>/ (e.g. Debug-appletvos/). The CMake on these Macs
+          # writes plain <cfg>/ instead, so the copy step failed (build 6b08785c). Apply the tvOS patch here,
+          # then make the copy fall back to <cfg>/. The scaffolding script sees a patched tree and only builds.
+          QJS="$HOME/quickjs-kt-tvos"
+          git clone --branch v1.0.5 --depth 1 https://github.com/dokar3/quickjs-kt "$QJS"
+          git -C "$QJS" submodule update --init --depth 1
+          git -C "$QJS" apply "$PWD/scaffolding/quickjs-kt-tvos.patch"
+          F="$QJS/buildSrc/src/main/kotlin/com/dokar/quickjs/buildQuickJsNativeLibrary.kt"
+          OLD='val libraryFile = file("native/build/$platform/${dir}libquickjs.$ext")'
+          NEW='val libraryFile = file("native/build/$platform/${dir}libquickjs.$ext").let { f -> if (f.exists()) f else file("native/build/$platform/$buildType/libquickjs.$ext") }'
+          grep -qF "$OLD" "$F" || { echo "quickjs copy line not found; patch layout changed" >&2; exit 1; }
+          python3 - "$F" "$OLD" "$NEW" <<'PY'
+          import sys
+          p, old, new = sys.argv[1:4]
+          s = open(p).read(); open(p, "w").write(s.replace(old, new, 1))
+          PY
+          cmake --version | head -1
+          bash scaffolding/build-quickjs-tvos.sh "$QJS"
       - name: Point the project at our bundle ids
         script: bash scripts/codemagic/prepare.sh
       - name: Apply signing
