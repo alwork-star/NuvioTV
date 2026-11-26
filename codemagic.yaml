@@ -14,7 +14,7 @@ workflows:
         APP_BUNDLE_ID: com.adamle.nuviotv
         APPLE_TEAM_ID: 797U56LQ33
       java: 17
-      xcode: latest
+      xcode: 27.0                          # AetherEngine requires Xcode 27 (Swift 6.4); Xcode 26 is best-effort upstream
     scripts:
       - name: Signing files (cheap; runs before the long compile)
         script: |
