@@ -1,0 +1,162 @@
+diff --git a/iosApp/NuvioTV/Screens/Player/LiveStreamRouting.swift b/iosApp/NuvioTV/Screens/Player/LiveStreamRouting.swift
+new file mode 100644
+index 0000000..d264909
+--- /dev/null
++++ b/iosApp/NuvioTV/Screens/Player/LiveStreamRouting.swift
+@@ -0,0 +1,45 @@
++import Foundation
++
++/// Streaming links (HLS / DASH manifests, IPTV live TS) play in NuvioTV's own player even when
++/// an external player (Infuse) is the viewer's default. Only the default route defers: a long-press
++/// "Play in <player>" still hands off, since the viewer asked for that player by name.
++///
++/// Decided from the link alone, before anything plays: a manifest is the "m3u8 or equivalent" the
++/// owner named, and live channels come as one. Debrid links (mp4 / mkv files) are never manifests,
++/// so movies and series still go to Infuse.
++///
++/// Pure, no player state: `LiveStreamRoutingTests` drives it.
++nonisolated enum LiveStreamRouting {
++    /// Path extensions of a streaming manifest: HLS (`m3u8`, plain `m3u` playlists) and DASH (`mpd`).
++    static let manifestExtensions: Set<String> = ["m3u8", "m3u", "mpd"]
++    /// Query keys IPTV panels and proxies use to name the output format (`?type=m3u8`, `output=hls`).
++    static let formatQueryKeys: Set<String> = ["type", "format", "output", "ext", "extension", "container"]
++    /// Values of those keys that mean a streaming manifest.
++    static let manifestFormatValues: Set<String> = ["m3u8", "m3u", "hls", "mpd", "dash"]
++
++    /// True when `urlString` is an http(s) link to a streaming manifest, or to an IPTV live channel
++    /// (`…/live/…/<id>.ts`, the Xtream Codes layout).
++    static func isStreamingManifest(_ urlString: String) -> Bool {
++        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
++        guard let parts = URLComponents(string: trimmed),
++              let scheme = parts.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return false }
++        let path = parts.percentEncodedPath.removingPercentEncoding?.lowercased() ?? parts.path.lowercased()
++        let ext = (path as NSString).pathExtension
++        if manifestExtensions.contains(ext) { return true }
++        if ext == "ts", path.split(separator: "/").contains("live") { return true }
++        for item in parts.queryItems ?? [] {
++            let value = (item.value ?? "").lowercased()
++            if formatQueryKeys.contains(item.name.lowercased()), manifestFormatValues.contains(value) { return true }
++            // A proxy that carries the real link in a parameter (`?url=https://…/index.m3u8`).
++            if value.hasPrefix("http"), let inner = URLComponents(string: value),
++               manifestExtensions.contains((inner.path as NSString).pathExtension.lowercased()) { return true }
++        }
++        return false
++    }
++
++    /// Whether a handoff should play in NuvioTV instead. `defaultRoute` is the plain-Select /
++    /// auto-play route to the default external player; an explicit long-press choice is not.
++    static func playsInNuvio(urlString: String, defaultRoute: Bool) -> Bool {
++        defaultRoute && isStreamingManifest(urlString)
++    }
++}
+diff --git a/iosApp/NuvioTV/Screens/StreamPickerView.swift b/iosApp/NuvioTV/Screens/StreamPickerView.swift
+index 6bcc3f0..17a9c5e 100644
+--- a/iosApp/NuvioTV/Screens/StreamPickerView.swift
++++ b/iosApp/NuvioTV/Screens/StreamPickerView.swift
+@@ -1556,6 +1556,15 @@ struct StreamPickerView: View {
+     /// started from.
+     private func openExternally(urlString: String, stream: StreamItem, listed: StreamItem, playerId: String,
+                                 rowKey: String? = nil, fallbackToInternal: Bool = false, autoAttempt: Int? = nil) {
++        // Live streams play in NuvioTV (`LiveStreamRouting`): an HLS / DASH manifest picked on the
++        // default-player route (`fallbackToInternal`: plain Select or auto-play) skips the hand-off.
++        // A long-press "Play in <player>" still hands off.
++        if LiveStreamRouting.playsInNuvio(urlString: urlString, defaultRoute: fallbackToInternal),
++           let url = URL(string: urlString.trimmingCharacters(in: .whitespacesAndNewlines)) {
++            print("[StreamPicker] streaming manifest: playing in NuvioTV instead of \(playerId)")
++            playInNuvioInstead(url: url, stream: stream, listed: listed, autoAttempt: autoAttempt)
++            return
++        }
+         // Review r1 (P2): one hand-off at a time. The subtitle wait makes this asynchronous, so a
+         // second Select during it would otherwise open the external player twice.
+         guard !externalHandOffInFlight else { return }
+@@ -1674,15 +1683,10 @@ struct StreamPickerView: View {
+         }
+         if fallbackToInternal, let url = URL(string: urlString) {
+             showToast(String(localized: "Couldn\u{2019}t open the external player \u{2014} playing in NuvioTV."))
+-            NextEpisodeEngine.consecutiveAutoPlays = 0
+             if let autoAttempt {
+                 autoPlayLog("[AutoPlay] external player \(playerId) did not open — attempt #\(autoAttempt) plays in NuvioTV")
+-                selected = context(url: url, stream: stream, listedStream: listed, streamKey: listed.playbackStreamKey,
+-                                   launchSource: .autoPlay, attempt: autoAttempt - 1)
+-            } else {
+-                selected = context(url: url, stream: stream, listedStream: listed, streamKey: listed.playbackStreamKey,
+-                                   launchSource: .manual)
+             }
++            playInNuvioInstead(url: url, stream: stream, listed: listed, autoAttempt: autoAttempt)
+         } else {
+             // An auto pick's cover was held for the hand-off: the list shows with the toast.
+             coverHold = false
+@@ -1690,6 +1694,20 @@ struct StreamPickerView: View {
+         }
+     }
+ 
++    /// Plays a stream meant for the default external player in the built-in player instead: a
++    /// hand-off that did not open, or a live stream (`LiveStreamRouting`). An auto start
++    /// (`autoAttempt`, 1-based) stays an auto start, so the walk continues on a failure.
++    private func playInNuvioInstead(url: URL, stream: StreamItem, listed: StreamItem, autoAttempt: Int?) {
++        NextEpisodeEngine.consecutiveAutoPlays = 0
++        if let autoAttempt {
++            selected = context(url: url, stream: stream, listedStream: listed, streamKey: listed.playbackStreamKey,
++                               launchSource: .autoPlay, attempt: autoAttempt - 1)
++        } else {
++            selected = context(url: url, stream: stream, listedStream: listed, streamKey: listed.playbackStreamKey,
++                               launchSource: .manual)
++        }
++    }
++
+     /// Duration for the external-player return: the stored progress entry's, else the episode's
+     /// runtime, else the title's catalog runtime. nil = unknown (the shared side then records the
+     /// position without a tracker scrobble).
+diff --git a/iosApp/NuvioTVTests/LiveStreamRoutingTests.swift b/iosApp/NuvioTVTests/LiveStreamRoutingTests.swift
+new file mode 100644
+index 0000000..7df3b16
+--- /dev/null
++++ b/iosApp/NuvioTVTests/LiveStreamRoutingTests.swift
+@@ -0,0 +1,47 @@
++import XCTest
++@testable import NuvioTV
++
++final class LiveStreamRoutingTests: XCTestCase {
++    func testHLSAndDASHManifestsAreStreaming() {
++        let live = [
++            "https://cdn.example.com/live/channel1/index.m3u8",
++            "https://cdn.example.com/hls/master.M3U8?token=abc&exp=123",
++            "http://iptv.example.net/playlist.m3u",
++            "https://dash.example.com/stream/manifest.mpd",
++            "  https://cdn.example.com/a/b/playlist.m3u8  ",
++            "https://cdn.example.com/a%20b/index.m3u8",
++        ]
++        for url in live { XCTAssertTrue(LiveStreamRouting.isStreamingManifest(url), url) }
++    }
++
++    func testIPTVLiveLayoutsAreStreaming() {
++        XCTAssertTrue(LiveStreamRouting.isStreamingManifest("http://panel.example.com:8080/live/user/pass/12345.ts"))
++        XCTAssertTrue(LiveStreamRouting.isStreamingManifest("http://panel.example.com/get.php?username=u&password=p&type=m3u8"))
++        XCTAssertTrue(LiveStreamRouting.isStreamingManifest("https://proxy.example.com/stream?output=HLS&id=9"))
++        XCTAssertTrue(LiveStreamRouting.isStreamingManifest("https://proxy.example.com/play?url=https://cdn.example.com/x/index.m3u8"))
++    }
++
++    func testFilesAreNotStreaming() {
++        let files = [
++            "https://download.real-debrid.com/d/ABCDEF/Movie.2024.2160p.mkv",
++            "https://cdn.torbox.app/dl/file.mp4?token=xyz",
++            "https://example.com/videos/episode.ts",          // a .ts file outside a /live/ path
++            "https://example.com/m3u8/movie.mp4",             // "m3u8" in a folder name only
++            "https://example.com/watch?type=movie&id=1",
++            "https://example.com/livestream/recording.mkv",
++            "magnet:?xt=urn:btih:abcdef",
++            "file:///var/mobile/index.m3u8",
++            "",
++            "not a url",
++        ]
++        for url in files { XCTAssertFalse(LiveStreamRouting.isStreamingManifest(url), url) }
++    }
++
++    func testOnlyTheDefaultRouteDefersToNuvio() {
++        let hls = "https://cdn.example.com/live/index.m3u8"
++        let mkv = "https://download.real-debrid.com/d/X/Movie.mkv"
++        XCTAssertTrue(LiveStreamRouting.playsInNuvio(urlString: hls, defaultRoute: true))
++        XCTAssertFalse(LiveStreamRouting.playsInNuvio(urlString: hls, defaultRoute: false), "long-press Play in Infuse keeps its choice")
++        XCTAssertFalse(LiveStreamRouting.playsInNuvio(urlString: mkv, defaultRoute: true), "debrid files still go to Infuse")
++    }
++}

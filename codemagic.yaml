@@ -54,7 +54,8 @@ workflows:
           [ "$NEXT" -lt 156 ] && NEXT=156
           echo "NEXT_BUILD_NUMBER=$NEXT" >> "$CM_ENV"
           echo "App record $APP_ADC_ID found; build number $NEXT"
-      - name: Submodules, toolchain and QuickJS for tvOS
+      - &sources
+        name: Submodules, toolchain and QuickJS for tvOS
         script: |
           # Not --recursive from the top: NuvioMobile carries a stale gitlink (libass-android) with no
           # .gitmodules url, which aborts a full recursive update. Fetch only what the tvOS build needs.
@@ -67,6 +68,9 @@ workflows:
           git -C NuvioMobile apply --check "$PWD/scaffolding/gcm-public-api.patch"
           git -C NuvioMobile apply "$PWD/scaffolding/gcm-public-api.patch"
           if grep -rn "CCCryptorGCM[A-Za-z]*(" NuvioMobile/shared/src; then echo "private GCM call still in shared sources" >&2; exit 1; fi
+          # Live streams (HLS / DASH manifests) play in NuvioTV's own player even with Infuse as default.
+          git -C NuvioMobile apply --check "$PWD/scaffolding/live-stream-internal-player.patch"
+          git -C NuvioMobile apply "$PWD/scaffolding/live-stream-internal-player.patch"
           command -v cmake >/dev/null || brew install cmake
           java -version 2>&1 | head -1
           # quickjs-kt expects Xcode output in <cfg>-<sdk>/ (e.g. Debug-appletvos/). The CMake on these Macs
@@ -143,3 +147,37 @@ workflows:
         notify:
           success: false
           failure: true
+  nuviotv-tests:
+    name: NuvioTV unit tests (tvOS simulator, no upload)
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+    environment:
+      vars:
+        APP_BUNDLE_ID: com.adamle.nuviotv
+        APPLE_TEAM_ID: 797U56LQ33
+        TEST_CLASSES: "LiveStreamRoutingTests FirstPlayAutoPlayControllerTests"  # space-separated NuvioTVTests classes to run
+      java: 17
+      xcode: 27.0
+    scripts:
+      - *sources
+      - name: Point the project at our bundle ids
+        script: bash scripts/codemagic/prepare.sh
+      - name: Unit tests on a tvOS simulator
+        script: |
+          cd NuvioMobile
+          SIM=$(xcrun simctl list devices available | grep -E "Apple TV 4K" | grep -oE "[0-9A-F-]{36}" | head -1)
+          [ -n "$SIM" ] || { xcrun simctl list devices available; echo "no Apple TV simulator" >&2; exit 1; }
+          echo "Simulator $SIM"
+          SPM="$HOME/spm-nuviotv"
+          xcodebuild -resolvePackageDependencies -project iosApp/iosApp.xcodeproj -scheme NuvioTVTests -clonedSourcePackagesDirPath "$SPM"
+          python3 ../scripts/codemagic/patch-packages.py "$SPM"
+          ONLY=""; for c in $TEST_CLASSES; do ONLY="$ONLY -only-testing:NuvioTVTests/$c"; done
+          set -o pipefail; mkdir -p /tmp/xcodebuild_logs
+          xcodebuild test -project iosApp/iosApp.xcodeproj -scheme NuvioTVTests \
+            -destination "platform=tvOS Simulator,id=$SIM" $ONLY \
+            -clonedSourcePackagesDirPath "$SPM" -disableAutomaticPackageResolution \
+            -derivedDataPath "$HOME/dd-tests" -collect-test-diagnostics never \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/xcodebuild_logs/tests.log | grep -E "Test Case|Executed|error:|\*\* TEST" || true
+          grep -q "\*\* TEST SUCCEEDED \*\*" /tmp/xcodebuild_logs/tests.log
+    artifacts:
+      - /tmp/xcodebuild_logs/*.log
