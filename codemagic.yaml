@@ -1,0 +1,69 @@
+# Codemagic cloud build: this fork of NuvioTV, signed with our own team and sent to TestFlight.
+# Nothing secret lives in this file. One-time setup is in CODEMAGIC.md.
+workflows:
+  nuviotv-testflight:
+    name: NuvioTV to TestFlight
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+    integrations:
+      app_store_connect: Chorus            # the team's existing App Store Connect API integration (same Apple account)
+    environment:
+      groups:
+        - nuviotv                          # CERTIFICATE_PRIVATE_KEY (required); TMDB_API_KEY etc. (optional)
+      vars:
+        APP_BUNDLE_ID: com.adamle.nuviotv
+        APPLE_TEAM_ID: 797U56LQ33
+      java: 17
+      xcode: latest
+    scripts:
+      - name: Signing files (cheap; runs before the long compile)
+        script: |
+          if [ -z "${CERTIFICATE_PRIVATE_KEY:-}" ]; then echo "CERTIFICATE_PRIVATE_KEY is not set: stopping so a new orphan certificate is not created" >&2; exit 1; fi
+          printf '%s\n' "$CERTIFICATE_PRIVATE_KEY" > /tmp/cert_key && chmod 600 /tmp/cert_key
+          # --create registers the bundle ids on the first run.
+          app-store-connect fetch-signing-files "$APP_BUNDLE_ID" --strict-match-identifier --type TVOS_APP_STORE --create --certificate-key @file:/tmp/cert_key
+          app-store-connect fetch-signing-files "$APP_BUNDLE_ID.topshelf" --strict-match-identifier --type TVOS_APP_STORE --create --certificate-key @file:/tmp/cert_key
+          keychain initialize
+          app-store-connect list-certificates --type DISTRIBUTION --certificate-key @file:/tmp/cert_key --save || \
+            app-store-connect list-certificates --type IOS_DISTRIBUTION --certificate-key @file:/tmp/cert_key --save
+          keychain add-certificates
+      - name: Stop early if the App Store Connect app record is missing
+        script: |
+          APPS=$(app-store-connect apps list --bundle-id-identifier "$APP_BUNDLE_ID" --strict-match-identifier --json 2>/dev/null || echo '[]')
+          APP_ADC_ID=$(printf '%s' "$APPS" | python3 -c 'import json,sys; a=json.load(sys.stdin); print(a[0]["id"] if a else "")')
+          if [ -z "$APP_ADC_ID" ]; then
+            echo "NO APP RECORD: create a tvOS app in App Store Connect with bundle id $APP_BUNDLE_ID, then run again." >&2
+            echo "The bundle ids are now registered, so they appear in the New App dropdown." >&2
+            exit 1
+          fi
+          LATEST=$(app-store-connect get-latest-testflight-build-number "$APP_ADC_ID" --platform TV_OS 2>/dev/null | tail -1 | tr -dc '0-9')
+          NEXT=$(( ${LATEST:-153} + 1 )); [ "$NEXT" -lt 154 ] && NEXT=154
+          echo "NEXT_BUILD_NUMBER=$NEXT" >> "$CM_ENV"
+          echo "App record $APP_ADC_ID found; build number $NEXT"
+      - name: Submodules, toolchain and QuickJS for tvOS
+        script: |
+          git submodule update --init --recursive --depth 1 || git submodule update --init --recursive
+          command -v cmake >/dev/null || brew install cmake
+          java -version 2>&1 | head -1
+          bash scaffolding/build-quickjs-tvos.sh "$HOME/quickjs-kt-tvos"
+      - name: Point the project at our bundle ids
+        script: bash scripts/codemagic/prepare.sh
+      - name: Apply signing
+        script: xcode-project use-profiles --project NuvioMobile/iosApp/iosApp.xcodeproj
+      - name: Build the tvOS app
+        script: |
+          cd NuvioMobile
+          xcode-project build-ipa --project iosApp/iosApp.xcodeproj --scheme NuvioTV
+    artifacts:
+      - NuvioMobile/build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+    publishing:
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: false
+      email:
+        recipients:
+          - gvbgolfer@gmail.com
+        notify:
+          success: false
+          failure: true
