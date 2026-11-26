@@ -50,7 +50,11 @@ workflows:
           echo "App record $APP_ADC_ID found; build number $NEXT"
       - name: Submodules, toolchain and QuickJS for tvOS
         script: |
-          git submodule update --init --recursive --depth 1 || git submodule update --init --recursive
+          # Not --recursive from the top: NuvioMobile carries a stale gitlink (libass-android) with no
+          # .gitmodules url, which aborts a full recursive update. Fetch only what the tvOS build needs.
+          git submodule update --init NuvioMobile
+          git -C NuvioMobile submodule update --init --recursive MPVKit
+          test -f NuvioMobile/MPVKit/Package.swift || { echo "MPVKit submodule missing" >&2; exit 1; }
           command -v cmake >/dev/null || brew install cmake
           java -version 2>&1 | head -1
           bash scaffolding/build-quickjs-tvos.sh "$HOME/quickjs-kt-tvos"
