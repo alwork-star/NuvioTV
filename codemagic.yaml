@@ -45,7 +45,13 @@ workflows:
             exit 1
           fi
           LATEST=$(app-store-connect get-latest-testflight-build-number "$APP_ADC_ID" --platform TV_OS 2>/dev/null | tail -1 | tr -dc '0-9')
-          NEXT=$(( ${LATEST:-153} + 1 )); [ "$NEXT" -lt 154 ] && NEXT=154
+          # TestFlight never lists a build Apple rejected in processing (154 was, ITMS-90338), so its latest
+          # number alone can repeat a used one (6b089122 re-used 154). Also count Codemagic's own build number,
+          # which rises on every run: never lower than 153 + BUILD_NUMBER.
+          NEXT=$(( ${LATEST:-153} + 1 ))
+          FLOOR=$(( 153 + ${BUILD_NUMBER:-0} ))
+          [ "$NEXT" -lt "$FLOOR" ] && NEXT=$FLOOR
+          [ "$NEXT" -lt 156 ] && NEXT=156
           echo "NEXT_BUILD_NUMBER=$NEXT" >> "$CM_ENV"
           echo "App record $APP_ADC_ID found; build number $NEXT"
       - name: Submodules, toolchain and QuickJS for tvOS
