@@ -47,6 +47,15 @@ fi
 /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool false" "$SUB/iosApp/NuvioTV/Info.plist" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c "Set :ITSAppUsesNonExemptEncryption false" "$SUB/iosApp/NuvioTV/Info.plist"
 
+# App Store Connect upload validation (ITMS-90502, build 6b0881a0): every 64-bit binary must list arm64 in
+# UIRequiredDeviceCapabilities. Upstream only sideloads, so its plists never needed it.
+for plist in "$SUB/iosApp/NuvioTV/Info.plist" "$SUB/iosApp/NuvioTopShelf/Info.plist"; do
+  /usr/libexec/PlistBuddy -c "Print :UIRequiredDeviceCapabilities" "$plist" >/dev/null 2>&1 \
+    || /usr/libexec/PlistBuddy -c "Add :UIRequiredDeviceCapabilities array" "$plist"
+  /usr/libexec/PlistBuddy -c "Print :UIRequiredDeviceCapabilities" "$plist" | grep -q arm64 \
+    || /usr/libexec/PlistBuddy -c "Add :UIRequiredDeviceCapabilities: string arm64" "$plist"
+done
+
 # Build number for TestFlight (the caller passes the next free number).
 if [ -n "${NEXT_BUILD_NUMBER:-}" ]; then
   sed -i '' "s/^CURRENT_PROJECT_VERSION=.*/CURRENT_PROJECT_VERSION=${NEXT_BUILD_NUMBER}/" "$SUB/iosApp/Configuration/Version.xcconfig"
