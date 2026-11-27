@@ -28,9 +28,41 @@ workflows:
           if [ "$(printf '%s' "$MATCH" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" -eq 0 ]; then
             echo "No existing distribution certificate matches CERTIFICATE_PRIVATE_KEY: stopping (would create a new one)." >&2; exit 1
           fi
+          # Top Shelf App Group (KEEP_APP_GROUP=1): an ACTIVE profile minted before the group was assigned
+          # to the bundle ids lacks it and would fail signing late, so delete any such profile now and
+          # let --create below mint a fresh one that carries the group.
+          if [ "${KEEP_APP_GROUP:-0}" = "1" ]; then
+            app-store-connect profiles list --type TVOS_APP_STORE --state ACTIVE --json > /tmp/profiles.json 2>/dev/null || echo '[]' > /tmp/profiles.json
+            python3 - "$APP_BUNDLE_ID" "$APPLE_TEAM_ID" > /tmp/stale_profiles.txt <<'PY'
+          import base64, json, plistlib, re, sys
+          app, team = sys.argv[1], sys.argv[2]
+          wanted = {f"{team}.{app}", f"{team}.{app}.topshelf"}
+          group = f"group.{app}"
+          for p in json.load(open("/tmp/profiles.json")):
+              attrs = p.get("attributes", {})
+              raw = base64.b64decode(attrs.get("profileContent") or "")
+              m = re.search(rb"<\?xml.*?</plist>", raw, re.S)
+              if not m:
+                  continue
+              ents = plistlib.loads(m.group(0)).get("Entitlements", {})
+              if ents.get("application-identifier") in wanted and group not in ents.get("com.apple.security.application-groups", []):
+                  print(p["id"])
+          PY
+            while read -r pid; do
+              [ -n "$pid" ] || continue
+              echo "Deleting profile $pid (no $APP_BUNDLE_ID App Group); a fresh one is created next"
+              app-store-connect profiles delete "$pid" --ignore-not-found
+            done < /tmp/stale_profiles.txt
+          fi
           # --create registers the bundle ids and profiles on the first run.
           app-store-connect fetch-signing-files "$APP_BUNDLE_ID" --strict-match-identifier --type TVOS_APP_STORE --create --certificate-key @file:/tmp/cert_key
           app-store-connect fetch-signing-files "$APP_BUNDLE_ID.topshelf" --strict-match-identifier --type TVOS_APP_STORE --create --certificate-key @file:/tmp/cert_key
+          if [ "${KEEP_APP_GROUP:-0}" = "1" ]; then
+            for f in "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision; do
+              security cms -D -i "$f" 2>/dev/null | grep -q "group.$APP_BUNDLE_ID" && echo "App Group in $(basename "$f")"
+            done | tee /tmp/group_profiles.txt
+            [ "$(wc -l < /tmp/group_profiles.txt)" -ge 2 ] || { echo "The signing profiles do not carry group.$APP_BUNDLE_ID: assign the App Group to both bundle ids in the developer portal, then run again." >&2; exit 1; }
+          fi
           keychain initialize
           app-store-connect list-certificates --type DISTRIBUTION --certificate-key @file:/tmp/cert_key --save || \
             app-store-connect list-certificates --type IOS_DISTRIBUTION --certificate-key @file:/tmp/cert_key --save
@@ -71,6 +103,8 @@ workflows:
           # Live streams (HLS / DASH manifests) play in NuvioTV's own player even with Infuse as default.
           git -C NuvioMobile apply --check "$PWD/scaffolding/live-stream-internal-player.patch"
           git -C NuvioMobile apply "$PWD/scaffolding/live-stream-internal-player.patch"
+          git -C NuvioMobile apply --check "$PWD/scaffolding/top-shelf-carousel.patch"
+          git -C NuvioMobile apply "$PWD/scaffolding/top-shelf-carousel.patch"
           command -v cmake >/dev/null || brew install cmake
           java -version 2>&1 | head -1
           # quickjs-kt expects Xcode output in <cfg>-<sdk>/ (e.g. Debug-appletvos/). The CMake on these Macs

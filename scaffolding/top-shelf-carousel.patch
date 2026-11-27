@@ -1,0 +1,226 @@
+diff --git a/iosApp/NuvioTopShelf/ContentProvider.swift b/iosApp/NuvioTopShelf/ContentProvider.swift
+index 0bac3e9..5658829 100644
+--- a/iosApp/NuvioTopShelf/ContentProvider.swift
++++ b/iosApp/NuvioTopShelf/ContentProvider.swift
+@@ -8,20 +8,28 @@
+ import Foundation
+ import TVServices
+ 
+-/// Top Shelf extension: renders the Continue Watching rail on the Apple TV home screen.
++/// Top Shelf extension: the full-screen carousel on the Apple TV home screen (the Paramount+ style).
+ ///
+ /// No SharedCore here — the extension can't link the KMP framework. The main app mirrors the
+ /// active profile's continue-watching entries into `top-shelf.json` in the shared App Group
+-/// container (see the app's `TopShelfSnapshot.swift`); this provider just reads and maps it.
++/// container (see the app's `TopShelfSnapshot.swift`); this provider reads it, puts those titles
++/// first, and tops the carousel up with trending movies and series from Cinemeta (no key needed).
++/// Without the App Group (or before anything is watched) the carousel is trending only.
+ ///
+ /// Actions deep-link back into the app on the `nuviotv://` scheme:
+-///   click (display) → nuviotv://title?…    play button → nuviotv://resume?…
++///   click (display) → nuviotv://title?…    play button → nuviotv://resume?… (trending: title)
+ class ContentProvider: TVTopShelfContentProvider {
+ 
+     // Keep in sync with the app's TopShelf enum (TopShelfSnapshot.swift).
+     private static let appGroupId = "group.com.nuvio.media.NuvioTV"
+     private static let snapshotFilename = "top-shelf.json"
+     private static let urlScheme = "nuviotv"
++    /// Carousel length: Continue Watching first, trending fills the rest.
++    private static let maxItems = 12
++    private static let trendingCatalogs = [
++        "https://cinemeta-catalogs.strem.io/top/catalog/movie/top.json",
++        "https://cinemeta-catalogs.strem.io/top/catalog/series/top.json",
++    ]
+ 
+     // Mirrors the app's Codable shapes (TopShelfSnapshot.swift).
+     private struct ItemSnapshot: Codable {
+@@ -44,44 +52,105 @@ class ContentProvider: TVTopShelfContentProvider {
+         let items: [ItemSnapshot]
+     }
+ 
++    /// The fields of a Cinemeta catalog entry the carousel uses. Everything optional: one odd
++    /// entry must never sink the whole catalog decode.
++    private struct CatalogMeta: Decodable {
++        let id: String?
++        let type: String?
++        let name: String?
++        let poster: String?
++        let background: String?
++        let description: String?
++        let releaseInfo: String?
++        let runtime: String?
++        let genres: [String]?
++    }
++
++    private struct CatalogResponse: Decodable {
++        let metas: [CatalogMeta]?
++    }
++
+     override func loadTopShelfContent() async -> (any TVTopShelfContent)? {
++        let watching = loadSnapshot()
++        var items = watching.compactMap { carouselItem(for: $0) }
++        var seen = Set(watching.map { $0.parentMetaId })
++
++        if items.count < Self.maxItems {
++            for meta in await loadTrending() {
++                guard items.count < Self.maxItems else { break }
++                guard let id = meta.id, !id.isEmpty, !seen.contains(id),
++                      let item = carouselItem(for: meta) else { continue }
++                seen.insert(id)
++                items.append(item)
++            }
++        }
++        guard !items.isEmpty else { return nil }  // falls back to the static Top Shelf image
++        return TVTopShelfCarouselContent(style: .details, items: Array(items.prefix(Self.maxItems)))
++    }
++
++    private func loadSnapshot() -> [ItemSnapshot] {
+         guard let containerURL = FileManager.default
+             .containerURL(forSecurityApplicationGroupIdentifier: Self.appGroupId)
+-        else { return nil }
+-
++        else { return [] }
+         // tvOS group containers are only writable under Library/Caches — the app writes there.
+         let fileURL = containerURL
+             .appendingPathComponent("Library/Caches", isDirectory: true)
+             .appendingPathComponent(Self.snapshotFilename)
+         guard let data = try? Data(contentsOf: fileURL),
+-              let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data),
+-              !snapshot.items.isEmpty
+-        else {
+-            return nil  // falls back to the static Top Shelf image
+-        }
++              let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data)
++        else { return [] }
++        return snapshot.items
++    }
+ 
+-        let items = snapshot.items.compactMap { topShelfItem(for: $0) }
+-        guard !items.isEmpty else { return nil }
++    /// Movies and series interleaved (movie, series, movie, …), so the carousel mixes both.
++    private func loadTrending() async -> [CatalogMeta] {
++        let lists = await withTaskGroup(of: (Int, [CatalogMeta]).self) { group in
++            for (index, address) in Self.trendingCatalogs.enumerated() {
++                group.addTask { (index, await Self.fetchCatalog(address)) }
++            }
++            var byIndex: [Int: [CatalogMeta]] = [:]
++            for await (index, metas) in group { byIndex[index] = metas }
++            return Self.trendingCatalogs.indices.map { byIndex[$0] ?? [] }
++        }
++        var mixed: [CatalogMeta] = []
++        let longest = lists.map(\.count).max() ?? 0
++        for i in 0..<longest {
++            for list in lists where i < list.count { mixed.append(list[i]) }
++        }
++        return mixed
++    }
+ 
+-        let section = TVTopShelfItemCollection(items: items)
+-        section.title = "Continue Watching"
+-        return TVTopShelfSectionedContent(sections: [section])
++    private static func fetchCatalog(_ address: String) async -> [CatalogMeta] {
++        guard let url = URL(string: address) else { return [] }
++        var request = URLRequest(url: url)
++        request.timeoutInterval = 8
++        guard let (data, response) = try? await URLSession.shared.data(for: request),
++              (response as? HTTPURLResponse)?.statusCode == 200,
++              let decoded = try? JSONDecoder().decode(CatalogResponse.self, from: data)
++        else { return [] }
++        return decoded.metas ?? []
+     }
+ 
+-    private func topShelfItem(for entry: ItemSnapshot) -> TVTopShelfSectionedItem? {
+-        let item = TVTopShelfSectionedItem(identifier: entry.videoId)
+-        item.title = itemTitle(for: entry)
+-        item.imageShape = .poster
+-        // The progress bar under the poster (0-1). The snapshot carries 0-100; it was decoded but
+-        // never set, so no Top Shelf item ever showed one.
+-        if let percent = entry.progressPercent, percent > 0 {
+-            item.playbackProgress = min(max(percent / 100, 0), 1)
++    // MARK: - Items
++
++    private func carouselItem(for entry: ItemSnapshot) -> TVTopShelfCarouselItem? {
++        guard let art = Self.backdropURL(entry.background) ?? Self.backdropURL(entry.displayPoster ?? entry.poster)
++        else { return nil }
++        let item = TVTopShelfCarouselItem(identifier: "cw-" + entry.videoId)
++        item.title = entry.title
++        item.contextTitle = "Continue Watching"
++        var summary: [String] = []
++        if let season = entry.season, let episode = entry.episode {
++            let label = "S\(season) E\(episode)"
++            summary.append(entry.episodeTitle.map { "\(label) · \($0)" } ?? label)
+         }
+-        if let poster = entry.displayPoster ?? entry.poster, let url = URL(string: poster) {
+-            item.setImageURL(url, for: [.screenScale1x, .screenScale2x])
++        if let percent = entry.progressPercent, percent > 0 {
++            summary.append("\(Int(min(percent, 100).rounded()))% watched")
+         }
+-
+-        if let display = displayURL(for: entry) {
++        if !summary.isEmpty { item.summary = summary.joined(separator: "\n") }
++        item.setImageURL(art, for: [.screenScale1x, .screenScale2x])
++        if let display = displayURL(id: entry.parentMetaId, type: entry.parentMetaType,
++                                    name: entry.title, poster: entry.poster) {
+             item.displayAction = TVTopShelfAction(url: display)
+         }
+         if let play = resumeURL(for: entry) {
+@@ -90,22 +159,49 @@ class ContentProvider: TVTopShelfContentProvider {
+         return item
+     }
+ 
+-    private func itemTitle(for entry: ItemSnapshot) -> String {
+-        if let season = entry.season, let episode = entry.episode {
+-            return "\(entry.title) · S\(season)E\(episode)"
+-        }
+-        return entry.title
++    private func carouselItem(for meta: CatalogMeta) -> TVTopShelfCarouselItem? {
++        guard let id = meta.id, let name = meta.name, !name.isEmpty,
++              let art = Self.backdropURL(meta.background),
++              let display = displayURL(id: id, type: meta.type ?? "movie", name: name, poster: meta.poster)
++        else { return nil }
++        let item = TVTopShelfCarouselItem(identifier: "tr-" + id)
++        item.title = name
++        item.contextTitle = meta.type == "series" ? "Trending Series" : "Trending Movies"
++        if let description = meta.description, !description.isEmpty { item.summary = description }
++        if let genre = meta.genres?.first { item.genre = genre }
++        if let minutes = meta.runtime.flatMap(Self.minutes) { item.duration = TimeInterval(minutes * 60) }
++        item.setImageURL(art, for: [.screenScale1x, .screenScale2x])
++        // Trending titles have nothing to resume: both buttons open the title page.
++        item.displayAction = TVTopShelfAction(url: display)
++        item.playAction = TVTopShelfAction(url: display)
++        return item
++    }
++
++    /// A full-screen backdrop URL. Metahub serves the same art at 1920x1080 as `large`.
++    private static func backdropURL(_ raw: String?) -> URL? {
++        guard var address = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !address.isEmpty else { return nil }
++        address = address.replacingOccurrences(of: "/background/medium/", with: "/background/large/")
++            .replacingOccurrences(of: "/background/small/", with: "/background/large/")
++        guard let url = URL(string: address), let scheme = url.scheme?.lowercased(),
++              scheme == "https" || scheme == "http" else { return nil }
++        return url
++    }
++
++    /// "109 min" → 109; nil when the runtime carries no number.
++    private static func minutes(_ runtime: String) -> Int? {
++        let digits = runtime.prefix { $0.isNumber }
++        return Int(digits).flatMap { $0 > 0 ? $0 : nil }
+     }
+ 
+-    private func displayURL(for entry: ItemSnapshot) -> URL? {
++    private func displayURL(id: String, type: String, name: String, poster: String?) -> URL? {
+         var components = URLComponents()
+         components.scheme = Self.urlScheme
+         components.host = "title"
+         components.queryItems = [
+-            URLQueryItem(name: "id", value: entry.parentMetaId),
+-            URLQueryItem(name: "type", value: entry.parentMetaType),
+-            URLQueryItem(name: "name", value: entry.title),
+-            URLQueryItem(name: "poster", value: entry.poster),
++            URLQueryItem(name: "id", value: id),
++            URLQueryItem(name: "type", value: type),
++            URLQueryItem(name: "name", value: name),
++            URLQueryItem(name: "poster", value: poster),
+         ]
+         return components.url
+     }
