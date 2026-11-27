@@ -58,7 +58,8 @@ workflows:
           app-store-connect fetch-signing-files "$APP_BUNDLE_ID" --strict-match-identifier --type TVOS_APP_STORE --create --certificate-key @file:/tmp/cert_key
           app-store-connect fetch-signing-files "$APP_BUNDLE_ID.topshelf" --strict-match-identifier --type TVOS_APP_STORE --create --certificate-key @file:/tmp/cert_key
           if [ "${KEEP_APP_GROUP:-0}" = "1" ]; then
-            for f in "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision; do
+            for f in "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/"*.mobileprovision "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision; do
+              [ -f "$f" ] || continue
               security cms -D -i "$f" 2>/dev/null | grep -q "group.$APP_BUNDLE_ID" && echo "App Group in $(basename "$f")"
             done | tee /tmp/group_profiles.txt
             [ "$(wc -l < /tmp/group_profiles.txt)" -ge 2 ] || { echo "The signing profiles do not carry group.$APP_BUNDLE_ID: assign the App Group to both bundle ids in the developer portal, then run again." >&2; exit 1; }
